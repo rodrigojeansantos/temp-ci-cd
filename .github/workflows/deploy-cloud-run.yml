@@ -7,6 +7,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       id-token: write
@@ -18,27 +19,64 @@ jobs:
       REPO: ${{ secrets.ARTIFACT_REPO }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - id: auth
+      - name: Auth (WIF)
+        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
 
-      - name: Build and push image (Cloud Build)
+      - name: Build & Push image (Cloud Build, no log streaming)
+        shell: bash
         run: |
+          set -euo pipefail
+
           IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:${GITHUB_SHA}"
+          echo "IMAGE=$IMAGE"
+
           BUILD_ID=$(gcloud builds submit --tag "$IMAGE" --async --format="value(id)")
-          echo "Build ID: $BUILD_ID"
-          gcloud builds wait "$BUILD_ID"
+          echo "BUILD_ID=$BUILD_ID"
+
+          # Espera o build terminar consultando status (sem stream de logs)
+          for i in {1..90}; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" --format="value(status)")
+            echo "Cloud Build status: $STATUS"
+
+            if [[ "$STATUS" == "SUCCESS" ]]; then
+              break
+            fi
+
+            if [[ "$STATUS" == "FAILURE" || "$STATUS" == "CANCELLED" || "$STATUS" == "TIMEOUT" ]]; then
+              echo "Build falhou. Detalhes:"
+              gcloud builds describe "$BUILD_ID" --format="yaml(status,logUrl,finishTime)"
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          # Se nunca chegou em SUCCESS, falha por timeout
+          if [[ "${STATUS:-}" != "SUCCESS" ]]; then
+            echo "Timeout esperando o Cloud Build terminar"
+            gcloud builds describe "$BUILD_ID" --format="yaml(status,logUrl,finishTime)"
+            exit 1
+          fi
 
       - name: Deploy to Cloud Run
+        shell: bash
         run: |
+          set -euo pipefail
+
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:${GITHUB_SHA}"
+
           gcloud run deploy "${SERVICE}" \
-            --image "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:${GITHUB_SHA}" \
+            --image "${IMAGE}" \
             --region "${REGION}" \
             --platform managed \
             --allow-unauthenticated
